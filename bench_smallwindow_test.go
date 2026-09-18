@@ -8,6 +8,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/google/uuid"
+	"github.com/polarsignals/iceberg-go"
+	"github.com/polarsignals/iceberg-go/catalog"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 
@@ -15,13 +17,15 @@ import (
 	"github.com/polarsignals/frostdb/query"
 	"github.com/polarsignals/frostdb/query/logicalplan"
 	"github.com/polarsignals/frostdb/samples"
+	"github.com/polarsignals/frostdb/storage"
 )
 
 // BenchmarkQuerySmallWindowManyBlocks measures a query over a small, fixed time
-// window as the number of persisted blocks grows. Each block covers a distinct
-// range of timestamps, and the query always asks for only the newest block's
-// range -- so every run matches the same amount of data, and only the number
-// of older, non-matching blocks changes.
+// window as the number of persisted blocks grows, using the default objstore
+// backend. Each block covers a distinct range of timestamps, and the query
+// always asks for only the newest block's range -- so every run matches the
+// same amount of data, and only the number of older, non-matching blocks
+// changes.
 //
 // If blocks were eliminated by their time range before being opened, the cost
 // would be roughly constant across block counts. To serve a query the store
@@ -38,6 +42,63 @@ import (
 //
 //	go test -run '^$' -bench BenchmarkQuerySmallWindowManyBlocks -benchmem -benchtime=20x
 func BenchmarkQuerySmallWindowManyBlocks(b *testing.B) {
+	benchmarkSmallWindowManyBlocks(b, func(bucket objstore.Bucket) DataSinkSource {
+		return NewDefaultObjstoreBucket(bucket)
+	})
+}
+
+// BenchmarkQuerySmallWindowManyBlocksIceberg runs the exact same workload as
+// BenchmarkQuerySmallWindowManyBlocks against the Iceberg backend, whose
+// manifests carry per-data-file upper/lower bounds for the partition columns.
+// Here the table is partitioned by timestamp, so the query planner can skip a
+// data file whose timestamp bounds fall entirely outside the query window
+// without opening it. The matched data is again always just the newest block.
+//
+// Pruning does not make the cost flat -- the manifest still has one entry per
+// data file, so reading it is O(total files) -- but it is far cheaper than
+// opening and decoding each block's Parquet metadata, so the cost grows much
+// more slowly with the block count than the default backend does. The manifest
+// and catalog machinery also add a fixed overhead, so for a small number of
+// blocks Iceberg is actually more expensive than the default backend; it wins
+// once enough non-matching blocks accumulate.
+//
+// Measured alongside BenchmarkQuerySmallWindowManyBlocks
+// (-benchmem -benchtime=20x), allocs/op -- default vs Iceberg:
+//
+//	blocks=1      4,624  vs   14,436
+//	blocks=25    12,271  vs   18,284
+//	blocks=100   36,126  vs   30,112
+//	blocks=400  131,535  vs   77,539
+//
+// i.e. ~28x growth (default) vs ~5x growth (Iceberg) from 1 to 400 blocks.
+//
+// (WithIcebergPartitionSpec does not physically repartition the data files; it
+// records each file's column bounds in the manifest, which is what enables the
+// skip. See storage.WithIcebergPartitionSpec.)
+//
+// Run with:
+//
+//	go test -run '^$' -bench BenchmarkQuerySmallWindowManyBlocksIceberg -benchmem -benchtime=20x
+func BenchmarkQuerySmallWindowManyBlocksIceberg(b *testing.B) {
+	benchmarkSmallWindowManyBlocks(b, func(bucket objstore.Bucket) DataSinkSource {
+		berg, err := storage.NewIceberg("/", catalog.NewHDFS("/", bucket), bucket,
+			storage.WithIcebergPartitionSpec(
+				iceberg.NewPartitionSpec( // Partition the table by timestamp.
+					iceberg.PartitionField{
+						Name:      "timestamp",
+						Transform: iceberg.IdentityTransform{},
+					},
+				),
+			))
+		require.NoError(b, err)
+		return berg
+	})
+}
+
+// benchmarkSmallWindowManyBlocks is the shared harness for the two benchmarks
+// above. makeStore builds the DataSinkSource under test from the bucket that
+// holds the persisted blocks.
+func benchmarkSmallWindowManyBlocks(b *testing.B, makeStore func(objstore.Bucket) DataSinkSource) {
 	const rowsPerBlock = 200
 
 	for _, numBlocks := range []int{1, 25, 100, 400} {
@@ -46,7 +107,7 @@ func BenchmarkQuerySmallWindowManyBlocks(b *testing.B) {
 			// The bucket holds the persisted blocks and survives the store
 			// being closed and reopened below.
 			bucket := objstore.NewInMemBucket()
-			sinksource := NewDefaultObjstoreBucket(bucket)
+			sinksource := makeStore(bucket)
 
 			writeBlocks(b, sinksource, numBlocks, rowsPerBlock)
 
@@ -109,7 +170,7 @@ func BenchmarkQuerySmallWindowManyBlocks(b *testing.B) {
 // sinksource, one per time bucket (block i covers timestamps
 // [i*1000, i*1000+rowsPerBlock)), then closes the store so the blocks live only
 // in the bucket.
-func writeBlocks(b *testing.B, sinksource *DefaultObjstoreBucket, numBlocks, rowsPerBlock int) {
+func writeBlocks(b *testing.B, sinksource DataSinkSource, numBlocks, rowsPerBlock int) {
 	b.Helper()
 	ctx := context.Background()
 	c, err := New(
